@@ -20,7 +20,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -588,6 +591,45 @@ class CodeArtifactMavenDockerIntegrationTest {
                 .body("versions[0].version", equalTo("1.0.0"))
                 .body("versions[0].status", equalTo("Published"))
                 .body("versions[0].origin.originType", equalTo("INTERNAL"));
+    }
+
+    /**
+     * The real-world gap this guards against: {@code ReposiliteSidecarClient#listPackageVersions}
+     * used to fetch every version's publish-time details page one at a time, so a package with
+     * many versions still answered no faster than its slowest version's own round trip, times the
+     * version count. This deploys enough versions that a broken fan-out (dropped, duplicated, or
+     * silently empty results from the bounded executor) would show up as something other than
+     * exactly this set of versions, against the real Reposilite sidecar, not a mock.
+     */
+    @Test
+    @Order(22)
+    void listPackageVersionsFetchesManyVersionsPublishTimesCorrectly() {
+        String packageName = "manyversions";
+        int versionCount = 12;
+        Set<String> expectedVersions = new HashSet<>();
+        for (int i = 1; i <= versionCount; i++) {
+            String version = "1.0." + i;
+            expectedVersions.add(version);
+            byte[] content = ("many-versions-bytes-" + i).getBytes(StandardCharsets.UTF_8);
+            given().header("Authorization", "Bearer " + bearerToken).body(content)
+                    .put("/codeartifact/maven/" + DOMAIN + "/" + REPO + "/com/example/" + packageName + "/" + version
+                            + "/" + packageName + "-" + version + ".jar")
+                    .then().statusCode(200);
+        }
+
+        JsonPath body = given().header("Authorization", AUTH)
+                .post("/v1/package/versions?domain=" + DOMAIN + "&repository=" + REPO + "&format=maven"
+                        + "&namespace=com.example&package=" + packageName)
+                .then().statusCode(200)
+                .body("package", equalTo(packageName))
+                .body("versions.size()", equalTo(versionCount))
+                .extract().jsonPath();
+        List<String> actualVersions = body.getList("versions.version", String.class);
+        assertEquals(expectedVersions, new HashSet<>(actualVersions));
+        String defaultDisplayVersion = body.getString("defaultDisplayVersion");
+        assertTrue(expectedVersions.contains(defaultDisplayVersion),
+                "expected defaultDisplayVersion to be one of the deployed versions, got "
+                        + defaultDisplayVersion);
     }
 
     /**

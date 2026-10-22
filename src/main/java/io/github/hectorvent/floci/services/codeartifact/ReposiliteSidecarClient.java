@@ -42,6 +42,13 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
     private static final String FORMAT = "maven";
     private static final Logger LOG = Logger.getLogger(ReposiliteSidecarClient.class);
     private static final String MAVEN_SETTINGS_PATH = "/api/settings/domain/maven";
+    /**
+     * {@link SidecarConcurrency#mapBounded}'s key for every {@code listPackageVersions} call: one
+     * shared constant, since {@link ReposiliteSidecarManager} backs every CodeArtifact Maven
+     * repository with the same single container, unlike pypiserver's one-container-per-repository
+     * shape.
+     */
+    private static final String SHARED_CONTAINER_KEY = "reposilite";
     private static final int REPOSITORY_READY_POLL_MAX_MS = 3_000;
     private static final int REPOSITORY_READY_POLL_INTERVAL_MS = 50;
     /** Real Maven metadata's own documented {@code lastUpdated} shape: UTC, {@code yyyyMMddHHmmss}. */
@@ -274,6 +281,12 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
      * "when this version became complete." A version directory with no {@code FILE} entries at
      * all (never happens through a real deploy, but not assumed impossible) reports no timestamp
      * rather than guessing one.
+     *
+     * <p>The per-version details requests run through {@link SidecarConcurrency#mapBounded}, not a
+     * plain sequential loop: an artifact with many versions used to make every one of those
+     * requests one at a time before returning even a single-result page. Keyed by {@link
+     * #SHARED_CONTAINER_KEY} so the concurrency cap holds across simultaneous calls too, since
+     * every Maven repository shares the one Reposilite container.
      */
     @Override
     public List<PackageVersionTimestamp> listPackageVersions(String repositoryContainerId, String domain,
@@ -295,16 +308,15 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
             throw new IllegalStateException("Could not list versions of " + packageName + " on the Reposilite "
                     + "sidecar: upstream returned " + artifactResponse.statusCode());
         }
-        List<PackageVersionTimestamp> result = new ArrayList<>();
+        List<String> versions = new ArrayList<>();
         for (JsonNode entry : readTree(artifactResponse.body()).path("files")) {
-            if (!"DIRECTORY".equals(entry.path("type").asText())) {
-                continue;
+            if ("DIRECTORY".equals(entry.path("type").asText())) {
+                versions.add(entry.path("name").asText());
             }
-            String version = entry.path("name").asText();
-            result.add(new PackageVersionTimestamp(version, latestFileTimestamp(baseUrl,
-                    versionDetailsPath(repositoryContainerId, namespace, packageName, version))));
         }
-        return result;
+        return SidecarConcurrency.mapBounded(SHARED_CONTAINER_KEY, versions, version -> new PackageVersionTimestamp(
+                version, latestFileTimestamp(baseUrl, versionDetailsPath(repositoryContainerId, namespace,
+                        packageName, version))));
     }
 
     private Instant latestFileTimestamp(String baseUrl, String versionDetailsPath) {

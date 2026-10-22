@@ -149,6 +149,12 @@ public class PypiserverSidecarClient implements RepositorySidecarManager {
      * lands on disk within the same upload, close enough that picking "the first one" over "the
      * most recently modified one" makes no practical difference, and the JSON listing gives no
      * way to know which upload order they actually arrived in regardless.
+     *
+     * <p>The per-version {@code HEAD} requests run through {@link SidecarConcurrency#mapBounded},
+     * not a plain sequential loop: a package with many versions used to make every one of those
+     * requests one at a time before returning even a single-result page. Keyed by {@code
+     * repositoryContainerId} so the concurrency cap holds across simultaneous calls against the
+     * same pypiserver container, not just within one of them.
      */
     @Override
     public List<PackageVersionTimestamp> listPackageVersions(String repositoryContainerId, String domain,
@@ -178,13 +184,13 @@ public class PypiserverSidecarClient implements RepositorySidecarManager {
         } catch (Exception e) {
             throw new IllegalStateException("Could not parse pypiserver's version listing for " + packageName, e);
         }
-        List<PackageVersionTimestamp> result = new ArrayList<>();
-        releases.fieldNames().forEachRemaining(version -> {
+        List<String> versions = new ArrayList<>();
+        releases.fieldNames().forEachRemaining(versions::add);
+        return SidecarConcurrency.mapBounded(repositoryContainerId, versions, version -> {
             JsonNode files = releases.path(version);
             String fileUrl = files.isEmpty() ? "" : files.get(0).path("url").asText("");
-            result.add(new PackageVersionTimestamp(version, fileUrl.isEmpty() ? null : lastModified(fileUrl)));
+            return new PackageVersionTimestamp(version, fileUrl.isEmpty() ? null : lastModified(fileUrl));
         });
-        return result;
     }
 
     private Instant lastModified(String fileUrl) {
